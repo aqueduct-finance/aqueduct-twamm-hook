@@ -33,10 +33,12 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
     using SafeCast for uint256;
     using PoolGetters for IPoolManager;
     using TickBitmap for mapping(int16 => uint256);
+    using CFAv1Library for CFAv1Library.InitData;
 
     int256 internal constant MIN_DELTA = -1;
     bool internal constant ZERO_FOR_ONE = true;
     bool internal constant ONE_FOR_ZERO = false;
+    bytes32 public constant CFA_ID = keccak256("org.superfluid-finance.agreements.ConstantFlowAgreement.v1");
 
     /// @notice Contains full state related to the TWAMM
     /// @member lastVirtualOrderTimestamp Last timestamp in which virtual orders were executed
@@ -56,26 +58,13 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
     mapping(Currency => mapping(address => uint256)) public tokensOwed;
 
     // superfluid
-    using CFAv1Library for CFAv1Library.InitData;
     CFAv1Library.InitData public cfaV1;
-    bytes32 public constant CFA_ID =
-        keccak256("org.superfluid-finance.agreements.ConstantFlowAgreement.v1");
     IConstantFlowAgreementV1 cfa;
-    ISuperfluid _host;
+    ISuperfluid immutable _host;
 
     constructor(IPoolManager _poolManager, ISuperfluid host) BaseHook(_poolManager) {
         assert(address(host) != address(0));
-
-        // register superapp
         _host = host;
-        cfa = IConstantFlowAgreementV1(address(host.getAgreementClass(CFA_ID)));
-        cfaV1 = CFAv1Library.InitData(host, cfa);
-        uint256 configWord =
-            SuperAppDefinitions.APP_LEVEL_FINAL |
-            SuperAppDefinitions.BEFORE_AGREEMENT_CREATED_NOOP |
-            SuperAppDefinitions.BEFORE_AGREEMENT_UPDATED_NOOP |
-            SuperAppDefinitions.BEFORE_AGREEMENT_TERMINATED_NOOP;
-        host.registerApp(configWord);
     }
 
     function getHooksCalls() public pure override returns (Hooks.Calls memory) {
@@ -148,6 +137,12 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
     /// @notice Initialize TWAMM state
     function initialize(State storage self) internal {
         self.lastVirtualOrderTimestamp = block.timestamp;
+
+        // TODO: issue registering super app in constructor or here at initialization
+        // workaround: use registerAppByFactory() in deployment contract (see AqueductTWAMM.t.sol)
+        // setup cfa
+        cfa = IConstantFlowAgreementV1(address(_host.getAgreementClass(CFA_ID)));
+        cfaV1 = CFAv1Library.InitData(_host, cfa);
     }
 
     struct CallbackData {
@@ -175,8 +170,9 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
     /// @param key The PoolKey for which to identify the amm pool of the order
     /// @param orderKey The OrderKey for the new order
     /// @param sellRate the per second 'flow rate' of the token being sold
+    /// @param msgSender msg.sender during a superfluid callback will be the host, so manually pass in the user address
     /// @return orderId The bytes32 ID of the order
-    function submitOrder(IPoolManager.PoolKey memory key, OrderKey memory orderKey, uint256 sellRate)
+    function submitOrder(IPoolManager.PoolKey memory key, OrderKey memory orderKey, uint256 sellRate, address msgSender)
         internal
         returns (bytes32 orderId)
     {
@@ -185,7 +181,7 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
 
         unchecked {
             // checks done in TWAMM library
-            orderId = _submitOrder(twamm, orderKey, sellRate);
+            orderId = _submitOrder(twamm, orderKey, sellRate, msgSender);
         }
 
         emit SubmitOrder(
@@ -200,11 +196,12 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
     /// @notice Submits a new long term order into the TWAMM
     /// @dev executeTWAMMOrders must be executed up to current timestamp before calling submitOrder
     /// @param orderKey The OrderKey for the new order
-    function _submitOrder(State storage self, OrderKey memory orderKey, uint256 sellRate)
+    /// @param msgSender See parent function
+    function _submitOrder(State storage self, OrderKey memory orderKey, uint256 sellRate, address msgSender)
         internal
         returns (bytes32 orderId)
     {
-        if (orderKey.owner != msg.sender) revert MustBeOwner(orderKey.owner, msg.sender);
+        if (orderKey.owner != msgSender) revert MustBeOwner(orderKey.owner, msgSender);
         if (self.lastVirtualOrderTimestamp == 0) revert NotInitialized();
         if (sellRate == 0) revert SellRateCannotBeZero();
 
@@ -224,7 +221,8 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
     /// @param key The PoolKey for which to identify the amm pool of the order
     /// @param orderKey The OrderKey for which to identify the order
     /// @param sellRate the per second 'flow rate' of the token being sold
-    function updateOrder(IPoolManager.PoolKey memory key, OrderKey memory orderKey, uint256 sellRate)
+    /// @param msgSender msg.sender during a superfluid callback will be the host, so manually pass in the user address
+    function updateOrder(IPoolManager.PoolKey memory key, OrderKey memory orderKey, uint256 sellRate, address msgSender)
         internal
         returns (uint256 tokens0Owed, uint256 tokens1Owed)
     {
@@ -233,7 +231,7 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
 
         // This call reverts if the caller is not the owner of the order
         (uint256 buyTokensOwed, uint256 newEarningsFactorLast) =
-            _updateOrder(twamm, orderKey, sellRate);
+            _updateOrder(twamm, orderKey, sellRate, msgSender);
 
         if (orderKey.zeroForOne) {
             tokens1Owed += buyTokensOwed;
@@ -248,14 +246,14 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
         );
     }
 
-    function _updateOrder(State storage self, OrderKey memory orderKey, uint256 sellRate)
+    function _updateOrder(State storage self, OrderKey memory orderKey, uint256 sellRate, address msgSender)
         internal
         returns (uint256 buyTokensOwed, uint256 earningsFactorLast)
     {
         Order storage order = _getOrder(self, orderKey);
         AqueductOrderPool.State storage orderPool = orderKey.zeroForOne ? self.orderPool0For1 : self.orderPool1For0;
 
-        if (orderKey.owner != msg.sender) revert MustBeOwner(orderKey.owner, msg.sender);
+        if (orderKey.owner != msgSender) revert MustBeOwner(orderKey.owner, msgSender);
         if (order.sellRate == 0) revert OrderDoesNotExist(orderKey);
 
         unchecked {
@@ -302,7 +300,10 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
 
         if (swapParams.zeroForOne) {
             if (delta.amount0() > 0) {
-                key.currency0.transfer(address(poolManager), uint256(uint128(delta.amount0())));
+                //key.currency0.transfer(address(poolManager), uint256(uint128(delta.amount0())));
+                ISuperToken tempToken0 = ISuperToken(Currency.unwrap(key.currency0));
+                uint256 balance0 = tempToken0.balanceOf(address(this));
+                tempToken0.transfer(address(poolManager), uint256(uint128(delta.amount0())));
                 poolManager.settle(key.currency0);
             }
             if (delta.amount1() < 0) {
@@ -310,7 +311,9 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
             }
         } else {
             if (delta.amount1() > 0) {
-                key.currency1.transfer(address(poolManager), uint256(uint128(delta.amount1())));
+                //key.currency1.transfer(address(poolManager), uint256(uint128(delta.amount1())));
+                ISuperToken tempToken1 = ISuperToken(Currency.unwrap(key.currency1));
+                tempToken1.transfer(address(poolManager), uint256(uint128(delta.amount1())));
                 poolManager.settle(key.currency1);
             }
             if (delta.amount0() < 0) {
@@ -625,9 +628,9 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
 
         // submit order
         if (twamm.orders[orderId].sellRate == 0) {
-            submitOrder(key, orderKey, sellRate);
+            submitOrder(key, orderKey, sellRate, user);
         } else {
-            updateOrder(key, orderKey, sellRate);
+            updateOrder(key, orderKey, sellRate, user);
         }
     }
 
@@ -639,7 +642,6 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
         bytes calldata ,//_cbdata,
         bytes calldata _ctx
     ) external override onlyHost returns (bytes memory newCtx) {
-        require(1 == 2);
         _handleSuperfluidCallback(_superToken, _agreementData, _ctx);
         newCtx = _ctx;
     }

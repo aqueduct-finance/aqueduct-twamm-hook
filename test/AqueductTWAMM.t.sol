@@ -26,7 +26,7 @@ import {
     CFAv1Library,
     SuperTokenFactory
 } from "@superfluid-finance/ethereum-contracts/contracts/utils/SuperfluidFrameworkDeployer.sol";
-import {ISuperToken} from "@superfluid-finance/ethereum-contracts/contracts/interfaces/superfluid/ISuperfluid.sol";
+import {ISuperToken, SuperAppDefinitions} from "@superfluid-finance/ethereum-contracts/contracts/interfaces/superfluid/ISuperfluid.sol";
 import {TestGovernance} from "@superfluid-finance/ethereum-contracts/contracts/utils/TestGovernance.sol";
 import {ConstantFlowAgreementV1} from "@superfluid-finance/ethereum-contracts/contracts/agreements/ConstantFlowAgreementV1.sol";
 import {TestToken} from "@superfluid-finance/ethereum-contracts/contracts/utils/TestToken.sol";
@@ -103,6 +103,7 @@ contract AqueductTWAMMTest is Test, Deployers, GasSnapshot {
         AqueductTWAMMImplementation impl = new AqueductTWAMMImplementation(manager, sf.host, twamm);
         (, bytes32[] memory writes) = vm.accesses(address(impl));
         vm.etch(address(twamm), address(impl).code);
+
         // for each storage key that was written during the hook implementation, copy the value over
         unchecked {
             for (uint256 i = 0; i < writes.length; i++) {
@@ -131,12 +132,31 @@ contract AqueductTWAMMTest is Test, Deployers, GasSnapshot {
         modifyPositionRouter.modifyPosition(
             poolKey, IPoolManager.ModifyPositionParams(TickMath.minUsableTick(60), TickMath.maxUsableTick(60), 10 ether)
         );
+
+        // register superapp
+        uint256 configWord =
+            SuperAppDefinitions.APP_LEVEL_FINAL |
+            SuperAppDefinitions.BEFORE_AGREEMENT_CREATED_NOOP |
+            SuperAppDefinitions.BEFORE_AGREEMENT_UPDATED_NOOP |
+            SuperAppDefinitions.BEFORE_AGREEMENT_TERMINATED_NOOP;
+        sf.host.registerAppByFactory(twamm, configWord);
     }
 
     function testTWAMMEndToEndSimSymmetricalOrderPools() public {
+        // check that pool is successfully registered as a super app
+        assertEq(sf.host.isApp(twamm), true);
+
+        assertEq(daix.balanceOf(address(twamm)), 0);
+
         // create the order with a ~~superfluid stream~~
-        IAqueductTWAMM.OrderKey memory orderKey1 = IAqueductTWAMM.OrderKey(address(this), true);
-        daix.createFlow(address(twamm), 10000000000);
-        
+        daix.createFlow(address(twamm), 10000000000, abi.encode(poolKey));
+        (, int96 flowRate, , ) = sf.cfa.getFlow(daix, address(this), address(twamm));
+        assertEq(flowRate, 10000000000); // check that flowrate is correct
+
+        // skip some time and execute the virtual order
+        vm.warp(10000);
+        twamm.executeTWAMMOrders(poolKey); // TODO: failing
+
+        // check that buy tokens owed is correct
     }
 }

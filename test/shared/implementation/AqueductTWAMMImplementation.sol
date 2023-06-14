@@ -6,8 +6,10 @@ import {AqueductTWAMM} from "../../../contracts/hooks/examples/AqueductTWAMM.sol
 import {IPoolManager} from "@uniswap/v4-core/contracts/interfaces/IPoolManager.sol";
 import {Hooks} from "@uniswap/v4-core/contracts/libraries/Hooks.sol";
 import {ISuperfluid} from "@superfluid-finance/ethereum-contracts/contracts/interfaces/superfluid/ISuperfluid.sol";
+import {SuperAppDefinitions} from "@superfluid-finance/ethereum-contracts/contracts/interfaces/superfluid/ISuperfluid.sol";
 
 contract AqueductTWAMMImplementation is AqueductTWAMM {
+
     constructor(IPoolManager poolManager, ISuperfluid host, AqueductTWAMM addressToEtch) AqueductTWAMM(poolManager, host) {
         Hooks.validateHookAddress(addressToEtch, getHooksCalls());
     }
