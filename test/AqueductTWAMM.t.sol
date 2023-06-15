@@ -142,7 +142,7 @@ contract AqueductTWAMMTest is Test, Deployers, GasSnapshot {
         sf.host.registerAppByFactory(twamm, configWord);
     }
 
-    function testTWAMMEndToEndSimSymmetricalOrderPools() public {
+    function testAqueductTWAMMStreamingOneDirection() public {
         // check that pool is successfully registered as a super app
         assertEq(sf.host.isApp(twamm), true);
 
@@ -155,8 +155,14 @@ contract AqueductTWAMMTest is Test, Deployers, GasSnapshot {
 
         // skip some time and execute the virtual order
         vm.warp(10000);
-        twamm.executeTWAMMOrders(poolKey); // TODO: failing
+        twamm.executeTWAMMOrders(poolKey);
 
         // check that buy tokens owed is correct
+        uint256 usdcxBalanceBefore = usdcx.balanceOf(address(this));
+        IAqueductTWAMM.OrderKey memory orderKey = IAqueductTWAMM.OrderKey(address(this), true);
+        twamm.claimTokens(poolKey, orderKey, address(this), 0);
+        uint256 usdcxBalanceAfter = usdcx.balanceOf(address(this));
+
+        assertTrue(usdcxBalanceAfter - usdcxBalanceBefore > 0); // TODO: check that this output amount is actually correct
     }
 }

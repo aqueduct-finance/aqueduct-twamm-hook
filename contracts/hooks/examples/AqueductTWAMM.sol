@@ -157,12 +157,16 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
         (uint160 sqrtPriceX96,,) = poolManager.getSlot0(poolId);
         State storage twamm = twammStates[poolId];
 
-        (bool zeroForOne, uint160 sqrtPriceLimitX96) = _executeTWAMMOrders(
+        (bool zeroForOne, uint160 sqrtPriceLimitX96, uint256 secondsElapsed) = _executeTWAMMOrders(
             twamm, poolManager, key, PoolParamsOnExecute(sqrtPriceX96, poolManager.getLiquidity(poolId))
         );
 
         if (sqrtPriceLimitX96 != 0 && sqrtPriceLimitX96 != sqrtPriceX96) {
-            poolManager.lock(abi.encode(key, IPoolManager.SwapParams(zeroForOne, type(int256).max, sqrtPriceLimitX96)));
+            // temp fix for one way order flow - delta for input token was more than total streamed amount
+            //poolManager.lock(abi.encode(key, IPoolManager.SwapParams(zeroForOne, type(int256).max, sqrtPriceLimitX96)));
+            AqueductOrderPool.State storage orderPool = zeroForOne ? twamm.orderPool0For1 : twamm.orderPool1For0;
+            int256 amountSelling = int256(orderPool.sellRateCurrent * secondsElapsed);
+            poolManager.lock(abi.encode(key, IPoolManager.SwapParams(zeroForOne, amountSelling, sqrtPriceLimitX96)));
         }
     }
 
@@ -281,10 +285,28 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
     }
 
     /// @inheritdoc IAqueductTWAMM
-    function claimTokens(Currency token, address to, uint256 amountRequested)
+    function claimTokens(IPoolManager.PoolKey memory key, OrderKey memory orderKey, address to, uint256 amountRequested)
         external
         returns (uint256 amountTransferred)
     {
+        require(orderKey.owner == msg.sender);
+
+        // update tokensOwed first
+        bytes32 poolId = keccak256(abi.encode(key));
+        State storage twamm = twammStates[poolId];
+        Order storage order = _getOrder(twamm, orderKey);
+        AqueductOrderPool.State storage orderPool = orderKey.zeroForOne ? twamm.orderPool0For1 : twamm.orderPool1For0;
+        uint256 earningsFactor = orderPool.earningsFactorCurrent - order.earningsFactorLast;    
+        uint256 buyTokensOwed = (earningsFactor * order.sellRate) >> FixedPoint96.RESOLUTION;
+        order.earningsFactorLast = orderPool.earningsFactorCurrent;
+        if (orderKey.zeroForOne) {
+            tokensOwed[key.currency1][orderKey.owner] += buyTokensOwed;
+        } else {
+            tokensOwed[key.currency0][orderKey.owner] += buyTokensOwed;
+        }
+
+        // transfer tokens
+        Currency token = orderKey.zeroForOne ? key.currency1 : key.currency0;
         uint256 currentBalance = token.balanceOfSelf();
         amountTransferred = tokensOwed[token][msg.sender];
         if (amountRequested != 0 && amountRequested < amountTransferred) amountTransferred = amountRequested;
@@ -300,10 +322,7 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
 
         if (swapParams.zeroForOne) {
             if (delta.amount0() > 0) {
-                //key.currency0.transfer(address(poolManager), uint256(uint128(delta.amount0())));
-                ISuperToken tempToken0 = ISuperToken(Currency.unwrap(key.currency0));
-                uint256 balance0 = tempToken0.balanceOf(address(this));
-                tempToken0.transfer(address(poolManager), uint256(uint128(delta.amount0())));
+                key.currency0.transfer(address(poolManager), uint256(uint128(delta.amount0())));
                 poolManager.settle(key.currency0);
             }
             if (delta.amount1() < 0) {
@@ -311,9 +330,7 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
             }
         } else {
             if (delta.amount1() > 0) {
-                //key.currency1.transfer(address(poolManager), uint256(uint128(delta.amount1())));
-                ISuperToken tempToken1 = ISuperToken(Currency.unwrap(key.currency1));
-                tempToken1.transfer(address(poolManager), uint256(uint128(delta.amount1())));
+                key.currency1.transfer(address(poolManager), uint256(uint128(delta.amount1())));
                 poolManager.settle(key.currency1);
             }
             if (delta.amount0() < 0) {
@@ -346,10 +363,10 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
         IPoolManager poolManager,
         IPoolManager.PoolKey memory key,
         PoolParamsOnExecute memory pool
-    ) internal returns (bool zeroForOne, uint160 newSqrtPriceX96) {
+    ) internal returns (bool zeroForOne, uint160 newSqrtPriceX96, uint256 secondsElapsed) {
         if (!_hasOutstandingOrders(self)) {
             self.lastVirtualOrderTimestamp = block.timestamp;
-            return (false, 0);
+            return (false, 0, 0);
         }
 
         uint160 initialSqrtPriceX96 = pool.sqrtPriceX96;
@@ -383,6 +400,7 @@ contract AqueductTWAMM is BaseHook, IAqueductTWAMM, SuperAppBase {
             }
         }
 
+        secondsElapsed = block.timestamp - prevTimestamp;
         self.lastVirtualOrderTimestamp = block.timestamp;
         newSqrtPriceX96 = pool.sqrtPriceX96;
         zeroForOne = initialSqrtPriceX96 > newSqrtPriceX96;

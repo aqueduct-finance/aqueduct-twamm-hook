@@ -90,11 +90,12 @@ interface IAqueductTWAMM {
     );
 
     /// @notice Claim tokens owed from TWAMM contract
-    /// @param token The token to claim
+    /// @param key The PoolKey for which to identify the amm pool of the order
+    /// @param orderKey The OrderKey for which to identify the order
     /// @param to The receipient of the claim
     /// @param amountRequested The amount of tokens requested to claim. Set to 0 to claim all.
     /// @return amountTransferred The total token amount to be collected
-    function claimTokens(Currency token, address to, uint256 amountRequested)
+    function claimTokens(IPoolManager.PoolKey memory key, OrderKey memory orderKey, address to, uint256 amountRequested)
         external
         returns (uint256 amountTransferred);
 
